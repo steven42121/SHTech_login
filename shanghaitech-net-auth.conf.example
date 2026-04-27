@@ -1,0 +1,35 @@
+# Copy to shanghaitech-net-auth.conf and chmod 600 it.
+
+USERNAME=2025XXXXXXX
+PASSWORD='replace-with-your-password'
+
+# Prefer a specific interface on servers, for example:
+#   Linux:  eth0 / ens192
+#   ESXi:   vmk0
+INTERFACE=eth0
+
+# Optional: override the detected campus IP directly.
+# IP_ADDR=10.19.123.45
+
+# Primary and fallback portal base URLs.
+SERVER=https://10.15.145.16:19008
+FALLBACK_SERVER=https://net-auth.shanghaitech.edu.cn:19008
+
+# Optional extra portal fields. The current portal accepts login without them.
+# AUTH_TYPE=1
+# AGREED=1
+# SSID=
+# VALID_CODE=
+# ACIP=
+# UMAC=
+
+# Connectivity check used by status/watch.
+CHECK_URL=http://www.msftconnecttest.com/connecttest.txt
+CHECK_EXPECT='Microsoft Connect Test'
+
+# Timeouts / loops.
+TIMEOUT=8
+INTERVAL=60
+
+# Set to 0 if you want strict certificate validation.
+INSECURE_TLS=1
