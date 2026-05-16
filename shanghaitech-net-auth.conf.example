@@ -15,6 +15,12 @@ INTERFACE=eth0
 SERVER=https://10.15.145.16:19008
 FALLBACK_SERVER=https://net-auth.shanghaitech.edu.cn:19008
 
+# Skip the portal TCP preflight if you already know the network is fine.
+# SKIP_PREFLIGHT=0
+
+# Disable automatic local firewall opening for the portal port.
+# AUTO_FIREWALL=1
+
 # Optional extra portal fields. The current portal accepts login without them.
 # AUTH_TYPE=1
 # AGREED=1

@@ -1,7 +1,7 @@
 #!/bin/sh
 
 SCRIPT_NAME=${0##*/}
-VERSION="0.1.0"
+VERSION="0.1.4"
 
 HOME_DIR=${HOME:-.}
 DEFAULT_CONFIG="./shanghaitech-net-auth.conf"
@@ -15,8 +15,8 @@ INTERVAL_DEFAULT="60"
 
 ACTION=""
 CONFIG_FILE=""
-USERNAME="${USERNAME:-}"
-PASSWORD="${PASSWORD:-}"
+USERNAME="${SH_NETAUTH_USERNAME:-}"
+PASSWORD="${SH_NETAUTH_PASSWORD:-}"
 IP_ADDR="${IP_ADDR:-}"
 INTERFACE="${INTERFACE:-}"
 SERVER="${SERVER:-$SERVER_DEFAULT}"
@@ -34,6 +34,10 @@ CHECK_EXPECT="${CHECK_EXPECT:-$CHECK_EXPECT_DEFAULT}"
 INTERVAL="${INTERVAL:-$INTERVAL_DEFAULT}"
 INSECURE_TLS="${INSECURE_TLS:-1}"
 VERBOSE=0
+SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
+AUTO_FIREWALL="${AUTO_FIREWALL:-1}"
+USERNAME_FROM_CLI=0
+POSITIONAL_USERNAME_USED=0
 
 log() {
   printf '%s\n' "$*"
@@ -55,19 +59,34 @@ debug() {
 }
 
 have_cmd() {
-  command -v "$1" >/dev/null 2>&1
+  type "$1" >/dev/null 2>&1
+}
+
+choose_python() {
+  if have_cmd python3 && python3 -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1; then
+    printf '%s\n' python3
+    return 0
+  fi
+  if have_cmd python && python -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1; then
+    printf '%s\n' python
+    return 0
+  fi
+  return 1
 }
 
 usage() {
-  cat <<EOF
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+  done <<EOF
 Usage:
-  $SCRIPT_NAME [login|status|watch|probe] [options]
+  $SCRIPT_NAME [login|status|watch|probe|doctor] [options]
 
 Commands:
   login              Perform one campus-network login. Default command.
   status             Show detected IP, portal sync result, and external reachability.
   watch              Check connectivity every N seconds and auto-login when offline.
   probe              Probe the portal endpoint only.
+  doctor             Diagnose IP, route, DNS, and portal TCP connectivity without credentials.
 
 Options:
   -c, --config PATH        Config file path
@@ -87,6 +106,8 @@ Options:
       --interval SEC       Watch interval, default 60
   -t, --timeout SEC        HTTP timeout, default 8
       --secure-tls         Verify TLS certificate
+      --skip-preflight     Skip portal TCP preflight before prompting for password
+      --no-firewall        Do not auto-open local firewall for the portal port
   -v, --verbose            Verbose output
   -h, --help               Show help
 
@@ -99,6 +120,8 @@ Config file format:
 
 Examples:
   $SCRIPT_NAME login -u 2025xxxxxxx -I eth0
+  $SCRIPT_NAME login 2025xxxxxxx -I eth0
+  $SCRIPT_NAME doctor -I eth0
   $SCRIPT_NAME status -c ./shanghaitech-net-auth.conf
   $SCRIPT_NAME watch -c ./shanghaitech-net-auth.conf --interval 30
 EOF
@@ -141,12 +164,55 @@ warn_if_config_world_readable() {
     mode=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null)
   fi
   if [ -n "$mode" ]; then
-    group_perm=$(printf '%s' "$mode" | awk '{print substr($0, length($0)-1, 1)}')
-    other_perm=$(printf '%s' "$mode" | awk '{print substr($0, length($0), 1)}')
-    if [ "$group_perm" != "0" ] || [ "$other_perm" != "0" ]; then
-      warn "Config file permissions are broad; run: chmod 600 $CONFIG_FILE"
-    fi
+    case "$mode" in
+      *00) ;;
+      *) warn "Config file permissions are broad; run: chmod 600 $CONFIG_FILE" ;;
+    esac
   fi
+}
+
+python_http_request() {
+  method=$1
+  url=$2
+  body=$3
+  py=$(choose_python) || return 1
+
+  SH_NETAUTH_METHOD=$method \
+  SH_NETAUTH_URL=$url \
+  SH_NETAUTH_BODY=$body \
+  SH_NETAUTH_TIMEOUT=$TIMEOUT \
+  SH_NETAUTH_INSECURE_TLS=$INSECURE_TLS \
+  "$py" - <<'PY'
+import os
+import ssl
+import sys
+import urllib.request
+import urllib.error
+
+method = os.environ.get("SH_NETAUTH_METHOD", "GET").upper()
+url = os.environ.get("SH_NETAUTH_URL", "")
+body = os.environ.get("SH_NETAUTH_BODY", "")
+timeout = float(os.environ.get("SH_NETAUTH_TIMEOUT", "8"))
+insecure = os.environ.get("SH_NETAUTH_INSECURE_TLS", "1") == "1"
+
+if not url:
+    sys.exit(1)
+
+data = body.encode("utf-8") if method == "POST" else None
+req = urllib.request.Request(url, data=data, method=method)
+if method == "POST":
+    req.add_header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+
+ctx = ssl._create_unverified_context() if insecure else ssl.create_default_context()
+
+try:
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        payload = resp.read().decode("utf-8", "ignore")
+        sys.stdout.write(payload)
+except Exception as exc:
+    sys.stderr.write(str(exc) + "\n")
+    sys.exit(1)
+PY
 }
 
 prompt_secret() {
@@ -183,39 +249,28 @@ ensure_credentials() {
 }
 
 is_ipv4() {
-  printf '%s\n' "$1" | awk -F. '
-    NF != 4 { ok = 0; exit }
-    BEGIN { ok = 1 }
-    {
-      for (i = 1; i <= 4; i++) {
-        if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) {
-          ok = 0
-          exit
-        }
-      }
-    }
-    END {
-      if (ok == 1) {
-        exit 0
-      }
-      exit 1
-    }
-  ' >/dev/null 2>&1
+  ip=$1
+  old_ifs=$IFS
+  IFS=.
+  set -- $ip
+  IFS=$old_ifs
+  [ $# -eq 4 ] || return 1
+  for octet in "$1" "$2" "$3" "$4"; do
+    case $octet in
+      ''|*[!0-9]*)
+        return 1
+        ;;
+    esac
+    [ "$octet" -ge 0 ] 2>/dev/null || return 1
+    [ "$octet" -le 255 ] 2>/dev/null || return 1
+  done
+  return 0
 }
 
 detect_ip_from_ip_route() {
   target=$1
   if have_cmd ip; then
-    ip route get "$target" 2>/dev/null | awk '
-      /src/ {
-        for (i = 1; i <= NF; i++) {
-          if ($i == "src") {
-            print $(i + 1)
-            exit
-          }
-        }
-      }
-    '
+    ip route get "$target" 2>/dev/null | sed -n 's/.* src \([0-9.][0-9.]*\).*/\1/p' | sed -n '1p'
   fi
 }
 
@@ -226,40 +281,21 @@ detect_ip_from_interface() {
     return 1
   fi
   if have_cmd ip; then
-    detected=$(ip -o -4 addr show dev "$iface" 2>/dev/null | awk '{split($4, a, "/"); print a[1]; exit}')
+    detected=$(ip -o -4 addr show dev "$iface" 2>/dev/null | sed -n 's/.* inet \([0-9.][0-9.]*\)\/.*/\1/p' | sed -n '1p')
     if is_ipv4 "$detected"; then
       printf '%s\n' "$detected"
       return 0
     fi
   fi
   if have_cmd ifconfig; then
-    detected=$(ifconfig "$iface" 2>/dev/null | awk '
-      /inet / {
-        for (i = 1; i <= NF; i++) {
-          if ($i == "inet") {
-            print $(i + 1)
-            exit
-          }
-          if ($i ~ /^addr:/) {
-            sub(/^addr:/, "", $i)
-            print $i
-            exit
-          }
-        }
-      }
-    ')
+    detected=$(ifconfig "$iface" 2>/dev/null | sed -n 's/.*inet \(addr:\)\{0,1\}\([0-9.][0-9.]*\).*/\2/p' | sed -n '1p')
     if is_ipv4 "$detected"; then
       printf '%s\n' "$detected"
       return 0
     fi
   fi
   if have_cmd esxcli; then
-    detected=$(esxcli network ip interface ipv4 get 2>/dev/null | awk -v iface="$iface" '
-      $1 == iface && $2 ~ /^[0-9]+\./ {
-        print $2
-        exit
-      }
-    ')
+    detected=$(esxcli network ip interface ipv4 get 2>/dev/null | sed -n "/^$iface[[:space:]]/s/^[^[:space:]]*[[:space:]][[:space:]]*\([0-9.][0-9.]*\).*/\1/p" | sed -n '1p')
     if is_ipv4 "$detected"; then
       printf '%s\n' "$detected"
       return 0
@@ -282,48 +318,46 @@ detect_ip_auto() {
   fi
 
   if have_cmd hostname; then
-    detected=$(hostname -I 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i !~ /^127\./) {print $i; exit}}')
-    if is_ipv4 "$detected"; then
-      printf '%s\n' "$detected"
-      return 0
-    fi
+    for candidate in $(hostname -I 2>/dev/null); do
+      case $candidate in
+        127.*) continue ;;
+      esac
+      if is_ipv4 "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+    :
   fi
 
   if have_cmd ifconfig; then
-    detected=$(ifconfig 2>/dev/null | awk '
-      /inet / {
-        ip = ""
-        for (i = 1; i <= NF; i++) {
-          if ($i == "inet") {
-            ip = $(i + 1)
-          } else if ($i ~ /^addr:/) {
-            sub(/^addr:/, "", $i)
-            ip = $i
-          }
-        }
-        if (ip != "" && ip !~ /^127\./) {
-          print ip
-          exit
-        }
-      }
-    ')
-    if is_ipv4 "$detected"; then
-      printf '%s\n' "$detected"
-      return 0
-    fi
+    while IFS= read -r line; do
+      candidate=$(printf '%s\n' "$line" | sed -n 's/.*inet \(addr:\)\{0,1\}\([0-9.][0-9.]*\).*/\2/p' | sed -n '1p')
+      case $candidate in
+        ''|127.*) continue ;;
+      esac
+      if is_ipv4 "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done <<EOF
+$(ifconfig 2>/dev/null)
+EOF
   fi
 
   if have_cmd esxcli; then
-    detected=$(esxcli network ip interface ipv4 get 2>/dev/null | awk '
-      NR > 1 && $2 ~ /^[0-9]+\./ && $2 != "127.0.0.1" {
-        print $2
-        exit
-      }
-    ')
-    if is_ipv4 "$detected"; then
-      printf '%s\n' "$detected"
-      return 0
-    fi
+    while IFS= read -r line; do
+      candidate=$(printf '%s\n' "$line" | sed -n 's/^[^[:space:]]*[[:space:]][[:space:]]*\([0-9.][0-9.]*\).*/\1/p' | sed -n '1p')
+      case $candidate in
+        ''|127.*) continue ;;
+      esac
+      if is_ipv4 "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done <<EOF
+$(esxcli network ip interface ipv4 get 2>/dev/null)
+EOF
   fi
 
   return 1
@@ -347,14 +381,16 @@ urlencode() {
   input=$1
   output=""
   while [ -n "$input" ]; do
-    ch=$(printf '%s' "$input" | cut -c1)
-    input=$(printf '%s' "$input" | cut -c2-)
+    ch=${input%"${input#?}"}
+    input=${input#?}
     case "$ch" in
       [A-Za-z0-9.~_-])
         output=${output}${ch}
         ;;
       *)
-        hex=$(printf '%s' "$ch" | od -An -tx1 | tr -d ' \n' | tr '[:lower:]' '[:upper:]')
+        hex=$(printf '%s' "$ch" | od -An -tx1)
+        hex=${hex# }
+        hex=${hex%% *}
         output=${output}%${hex}
         ;;
     esac
@@ -390,12 +426,23 @@ build_login_body() {
 
 json_get_bool() {
   key=$1
-  printf '%s' "$2" | sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\\(true\\|false\\).*/\\1/p" | head -n 1
+  json=$2
+  json=${json#*\"$key\"}
+  json=${json#*:}
+  json=${json#"${json%%[! ]*}"}
+  case "$json" in
+    true*) printf '%s\n' true ;;
+    false*) printf '%s\n' false ;;
+  esac
 }
 
 json_get_string() {
   key=$1
-  printf '%s' "$2" | sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
+  json=$2
+  json=${json#*\"$key\"}
+  json=${json#*:}
+  json=${json#*\"}
+  printf '%s\n' "${json%%\"*}"
 }
 
 lookup_error() {
@@ -436,16 +483,18 @@ http_post() {
     return $?
   fi
 
-  if have_cmd wget; then
-    wget_flags="-qO - --timeout=$TIMEOUT"
-    if [ "$INSECURE_TLS" = "1" ]; then
-      wget_flags="$wget_flags --no-check-certificate"
+  if choose_python >/dev/null 2>&1; then
+    response=$(python_http_request POST "$url" "$body" 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      warn "HTTP POST failed: $response"
+      return "$rc"
     fi
-    wget $wget_flags --header="Content-Type: application/x-www-form-urlencoded; charset=UTF-8" --post-data="$body" "$url"
-    return $?
+    printf '%s' "$response"
+    return 0
   fi
 
-  die "Neither curl nor wget is available."
+  die "Neither curl nor Python 3 is available for HTTP POST."
 }
 
 http_get() {
@@ -468,7 +517,18 @@ http_get() {
     return $?
   fi
 
-  die "Neither curl nor wget is available."
+  if choose_python >/dev/null 2>&1; then
+    response=$(python_http_request GET "$url" "" 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      warn "HTTP GET failed: $response"
+      return "$rc"
+    fi
+    printf '%s' "$response"
+    return 0
+  fi
+
+  die "Neither curl, wget, nor Python 3 is available for HTTP GET."
 }
 
 check_online() {
@@ -486,6 +546,297 @@ check_online() {
   [ -n "$content" ]
 }
 
+extract_host_port() {
+  url=$1
+  rest=${url#*://}
+  hostport=${rest%%/*}
+  host=${hostport%%:*}
+  port=${hostport#*:}
+  if [ "$port" = "$hostport" ]; then
+    case "$url" in
+      https://*) port=443 ;;
+      http://*) port=80 ;;
+      *) port=443 ;;
+    esac
+  fi
+  printf '%s %s\n' "$host" "$port"
+}
+
+esxi_firewall_ruleset_name() {
+  port=$1
+  printf 'shtechAuth%s\n' "$port"
+}
+
+ensure_esxi_portal_firewall() {
+  base_url=$1
+  have_cmd esxcli || return 0
+
+  set -- $(extract_host_port "$base_url")
+  port=$2
+  case "$port" in
+    ''|*[!0-9]*)
+      warn "ESXi firewall setup skipped for invalid port: $port"
+      return 1
+      ;;
+    80|443)
+      return 0
+      ;;
+  esac
+
+  ruleset=$(esxi_firewall_ruleset_name "$port")
+  firewall_file="/etc/vmware/firewall/${ruleset}.xml"
+
+  if ! cat > "$firewall_file" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<ConfigRoot>
+  <service id='9000'>
+    <id>$ruleset</id>
+    <rule id='0000'>
+      <direction>outbound</direction>
+      <protocol>tcp</protocol>
+      <porttype>dst</porttype>
+      <port>$port</port>
+    </rule>
+    <enabled>true</enabled>
+    <required>false</required>
+  </service>
+</ConfigRoot>
+EOF
+  then
+    warn "Failed to write ESXi firewall service: $firewall_file"
+    return 1
+  fi
+
+  chmod 644 "$firewall_file" 2>/dev/null || true
+
+  if ! esxcli network firewall refresh >/dev/null 2>&1; then
+    warn "Failed to refresh ESXi firewall after updating $ruleset"
+    return 1
+  fi
+
+  esxcli network firewall ruleset set -r "$ruleset" -e true >/dev/null 2>&1 || true
+  debug "ESXi firewall rule ensured: $ruleset -> tcp/$port"
+  return 0
+}
+
+linux_firewall_cmd() {
+  if have_cmd firewall-cmd; then
+    printf '%s\n' firewalld
+    return 0
+  fi
+  if have_cmd ufw; then
+    printf '%s\n' ufw
+    return 0
+  fi
+  if have_cmd iptables; then
+    printf '%s\n' iptables
+    return 0
+  fi
+  return 1
+}
+
+ensure_linux_portal_firewall() {
+  base_url=$1
+  [ "$AUTO_FIREWALL" = "1" ] || return 0
+  have_cmd esxcli && return 0
+
+  set -- $(extract_host_port "$base_url")
+  port=$2
+  case "$port" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+    80|443)
+      return 0
+      ;;
+  esac
+
+  backend=$(linux_firewall_cmd) || return 0
+
+  case "$backend" in
+    firewalld)
+      if firewall-cmd --state >/dev/null 2>&1; then
+        if firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1; then
+          firewall-cmd --reload >/dev/null 2>&1 || true
+          debug "Linux firewall rule ensured via firewalld: tcp/$port"
+        fi
+      fi
+      ;;
+    ufw)
+      if ufw status >/dev/null 2>&1; then
+        if ufw allow "${port}/tcp" >/dev/null 2>&1; then
+          debug "Linux firewall rule ensured via ufw: tcp/$port"
+        fi
+      fi
+      ;;
+    iptables)
+      if iptables -C OUTPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+        return 0
+      fi
+      if iptables -I OUTPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+        debug "Linux firewall rule ensured via iptables: tcp/$port"
+      fi
+      ;;
+  esac
+}
+
+resolve_host() {
+  host=$1
+  resolved=""
+
+  if is_ipv4 "$host"; then
+    printf '%s\n' "$host"
+    return 0
+  fi
+
+  if have_cmd getent; then
+    resolved=$(getent ahostsv4 "$host" 2>/dev/null | sed -n 's/^\([0-9.][0-9.]*\)[[:space:]].*/\1/p' | sed -n '1p')
+    if is_ipv4 "$resolved"; then
+      printf '%s\n' "$resolved"
+      return 0
+    fi
+  fi
+
+  py=$(choose_python 2>/dev/null) || return 1
+  resolved=$(SH_NETAUTH_HOST="$host" "$py" - <<'PY'
+import os
+import socket
+import sys
+
+host = os.environ.get("SH_NETAUTH_HOST", "")
+try:
+    infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    for info in infos:
+        addr = info[4][0]
+        if addr:
+            print(addr)
+            raise SystemExit(0)
+except Exception:
+    pass
+sys.exit(1)
+PY
+)
+  if is_ipv4 "$resolved"; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+
+  return 1
+}
+
+tcp_check_python() {
+  host=$1
+  port=$2
+  py=$(choose_python) || return 1
+  SH_NETAUTH_HOST=$host \
+  SH_NETAUTH_PORT=$port \
+  SH_NETAUTH_TIMEOUT=$TIMEOUT \
+  "$py" - <<'PY'
+import os
+import socket
+import sys
+
+host = os.environ.get("SH_NETAUTH_HOST", "")
+port = int(os.environ.get("SH_NETAUTH_PORT", "0"))
+timeout = float(os.environ.get("SH_NETAUTH_TIMEOUT", "8"))
+
+try:
+    with socket.create_connection((host, port), timeout=timeout):
+        pass
+except Exception as exc:
+    sys.stderr.write(str(exc) + "\n")
+    sys.exit(1)
+PY
+}
+
+tcp_check() {
+  host=$1
+  port=$2
+
+  if have_cmd nc; then
+    nc -vz -w "$TIMEOUT" "$host" "$port" >/dev/null 2>&1
+    return $?
+  fi
+
+  if have_cmd nc.openbsd; then
+    nc.openbsd -vz -w "$TIMEOUT" "$host" "$port" >/dev/null 2>&1
+    return $?
+  fi
+
+  if choose_python >/dev/null 2>&1; then
+    tcp_check_python "$host" "$port" >/dev/null 2>&1
+    return $?
+  fi
+
+  return 2
+}
+
+print_tcp_result() {
+  label=$1
+  base_url=$2
+  set -- $(extract_host_port "$base_url")
+  host=$1
+  port=$2
+
+  if tcp_check "$host" "$port"; then
+    log "$label TCP:  reachable ($host:$port)"
+    return 0
+  fi
+
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    log "$label TCP:  unknown ($host:$port, no nc or Python 3)"
+  else
+    log "$label TCP:  not reachable ($host:$port)"
+  fi
+  return "$rc"
+}
+
+print_dns_result() {
+  label=$1
+  host=$2
+
+  if resolve_host "$host" >/dev/null 2>&1; then
+    log "$label DNS: resolved ($host)"
+    return 0
+  fi
+
+  log "$label DNS: cannot resolve ($host)"
+  return 1
+}
+
+check_portal_reachable() {
+  set -- $(extract_host_port "$SERVER")
+  host=$1
+  port=$2
+
+  if tcp_check "$host" "$port"; then
+    return 0
+  fi
+
+  if [ "$FALLBACK_SERVER" != "$SERVER" ]; then
+    set -- $(extract_host_port "$FALLBACK_SERVER")
+    host=$1
+    port=$2
+    if ! resolve_host "$host" >/dev/null 2>&1; then
+      return 1
+    fi
+    if tcp_check "$host" "$port"; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+print_command_output() {
+  title=$1
+  shift
+  log ""
+  log "== $title =="
+  "$@" 2>&1 || true
+}
+
 probe_portal() {
   url=$1/portalauth/syncPortalResult
   http_post "$url" ""
@@ -493,13 +844,13 @@ probe_portal() {
 
 perform_login_once() {
   base_url=$1
-  login_body=$(build_login_body)
   login_url=$base_url/portalauth/login
 
   debug "POST $login_url"
   debug "Using IP $IP_ADDR"
 
-  response=$(http_post "$login_url" "$login_body" 2>/dev/null) || {
+  login_body=$(build_login_body)
+  response=$(http_post "$login_url" "$login_body") || {
     warn "Request to $login_url failed."
     return 1
   }
@@ -526,17 +877,44 @@ perform_login_once() {
 }
 
 perform_login() {
-  ensure_credentials
   ensure_ip
+
+  if have_cmd esxcli; then
+    ensure_esxi_portal_firewall "$SERVER" || true
+    if [ "$FALLBACK_SERVER" != "$SERVER" ]; then
+      ensure_esxi_portal_firewall "$FALLBACK_SERVER" || true
+    fi
+  else
+    ensure_linux_portal_firewall "$SERVER" || true
+    if [ "$FALLBACK_SERVER" != "$SERVER" ]; then
+      ensure_linux_portal_firewall "$FALLBACK_SERVER" || true
+    fi
+  fi
+
+  if [ "$SKIP_PREFLIGHT" != "1" ]; then
+    if ! check_portal_reachable; then
+      warn "Portal TCP preflight failed before password input."
+      warn "This machine cannot reach $SERVER or $FALLBACK_SERVER on the auth port."
+      warn "Fix network/routing first, or run '$SCRIPT_NAME doctor -I ${INTERFACE:-IFACE}' for details."
+      return 1
+    fi
+  fi
+
+  ensure_credentials
 
   if perform_login_once "$SERVER"; then
     return 0
   fi
 
   if [ "$FALLBACK_SERVER" != "$SERVER" ]; then
-    warn "Retrying with fallback portal: $FALLBACK_SERVER"
-    perform_login_once "$FALLBACK_SERVER"
-    return $?
+    set -- $(extract_host_port "$FALLBACK_SERVER")
+    fallback_host=$1
+    if resolve_host "$fallback_host" >/dev/null 2>&1; then
+      warn "Retrying with fallback portal: $FALLBACK_SERVER"
+      perform_login_once "$FALLBACK_SERVER"
+      return $?
+    fi
+    warn "Skipping fallback portal because DNS cannot resolve: $fallback_host"
   fi
 
   return 1
@@ -546,8 +924,14 @@ perform_status() {
   ensure_ip
   log "Detected IP: $IP_ADDR"
   log "Portal:      $SERVER"
+  print_tcp_result "Portal" "$SERVER" || true
+  if [ "$FALLBACK_SERVER" != "$SERVER" ]; then
+    print_tcp_result "Fallback" "$FALLBACK_SERVER" || true
+    set -- $(extract_host_port "$FALLBACK_SERVER")
+    print_dns_result "Fallback host" "$1" || true
+  fi
 
-  portal_response=$(probe_portal "$SERVER" 2>/dev/null || printf '')
+  portal_response=$(probe_portal "$SERVER" || printf '')
   if [ -n "$portal_response" ]; then
     portal_success=$(json_get_bool success "$portal_response")
     portal_error=$(json_get_string errorcode "$portal_response")
@@ -565,11 +949,72 @@ perform_status() {
 
 perform_probe() {
   log "Portal: $SERVER"
-  response=$(probe_portal "$SERVER" 2>/dev/null || printf '')
+  response=$(probe_portal "$SERVER" || printf '')
   if [ -z "$response" ]; then
     die "Probe failed."
   fi
   log "$response"
+}
+
+perform_doctor() {
+  ensure_ip
+  if have_cmd esxcli; then
+    ensure_esxi_portal_firewall "$SERVER" || true
+    if [ "$FALLBACK_SERVER" != "$SERVER" ]; then
+      ensure_esxi_portal_firewall "$FALLBACK_SERVER" || true
+    fi
+  else
+    ensure_linux_portal_firewall "$SERVER" || true
+    if [ "$FALLBACK_SERVER" != "$SERVER" ]; then
+      ensure_linux_portal_firewall "$FALLBACK_SERVER" || true
+    fi
+  fi
+  log "ShanghaiTech network auth doctor"
+  log "Version:     $VERSION"
+  log "Detected IP: $IP_ADDR"
+  if [ -n "$INTERFACE" ]; then
+    log "Interface:   $INTERFACE"
+  fi
+  log "Portal:      $SERVER"
+  log "Fallback:    $FALLBACK_SERVER"
+  log "Timeout:     ${TIMEOUT}s"
+  log ""
+  print_tcp_result "Portal" "$SERVER" || true
+  if [ "$FALLBACK_SERVER" != "$SERVER" ]; then
+    print_tcp_result "Fallback" "$FALLBACK_SERVER" || true
+    set -- $(extract_host_port "$FALLBACK_SERVER")
+    print_dns_result "Fallback host" "$1" || true
+  fi
+  print_tcp_result "Redirect probe" "http://10.10.10.10:80" || true
+
+  if check_online; then
+    log "Internet:    reachable"
+  else
+    log "Internet:    not reachable through $CHECK_URL"
+  fi
+
+  if have_cmd esxcli; then
+    print_command_output "ESXi IPv4 interfaces" esxcli network ip interface ipv4 get
+    print_command_output "ESXi IPv4 routes" esxcli network ip route ipv4 list
+    print_command_output "ESXi DNS servers" esxcli network ip dns server list
+  else
+    if have_cmd ip; then
+      print_command_output "ip addr" ip -4 addr
+      print_command_output "ip route" ip route
+    fi
+    if have_cmd ifconfig; then
+      print_command_output "ifconfig" ifconfig
+    fi
+  fi
+
+  log ""
+  if check_portal_reachable; then
+    log "Result: portal auth backend is reachable from this machine."
+  else
+    warn "Result: portal auth backend is NOT reachable from this machine."
+    warn "On your Windows host the backend is reachable from campus IP 10.19.73.3."
+    warn "If this host only has 192.168.x.x, it is probably behind a NAT/management network that cannot reach the campus auth backend."
+  fi
 }
 
 perform_watch() {
@@ -597,6 +1042,10 @@ apply_arguments() {
         ACTION=$1
         shift
         ;;
+      doctor)
+        ACTION=$1
+        shift
+        ;;
       -c|--config)
         CONFIG_FILE=$2
         shift 2
@@ -607,6 +1056,7 @@ apply_arguments() {
         ;;
       -u|--username)
         USERNAME=$2
+        USERNAME_FROM_CLI=1
         shift 2
         ;;
       -p|--password)
@@ -669,6 +1119,14 @@ apply_arguments() {
         INSECURE_TLS=0
         shift
         ;;
+      --skip-preflight)
+        SKIP_PREFLIGHT=1
+        shift
+        ;;
+      --no-firewall)
+        AUTO_FIREWALL=0
+        shift
+        ;;
       -v|--verbose)
         VERBOSE=1
         shift
@@ -677,7 +1135,20 @@ apply_arguments() {
         usage
         exit 0
         ;;
+      -*)
+        die "Unknown argument: $1"
+        ;;
       *)
+        if [ -z "$ACTION" ]; then
+          ACTION="login"
+        fi
+        if [ "$ACTION" = "login" ] && [ "$POSITIONAL_USERNAME_USED" -eq 0 ] && [ "$USERNAME_FROM_CLI" -eq 0 ]; then
+          USERNAME=$1
+          USERNAME_FROM_CLI=1
+          POSITIONAL_USERNAME_USED=1
+          shift
+          continue
+        fi
         die "Unknown argument: $1"
         ;;
     esac
@@ -716,6 +1187,9 @@ case "$ACTION" in
     ;;
   probe)
     perform_probe
+    ;;
+  doctor)
+    perform_doctor
     ;;
   *)
     usage

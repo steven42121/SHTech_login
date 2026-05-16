@@ -17,16 +17,14 @@ That means the script does not depend on the old front-end fields unless you exp
 
 ## Requirements
 
-At least one of:
+For HTTPS POST login, at least one of:
 
 - `curl`
-- `wget`
+- Python 3
 
 And a few standard tools that are commonly present on Linux / BusyBox / ESXi:
 
-- `awk`
 - `sed`
-- `cut`
 - `od`
 
 For automatic IP detection, one of these helps:
@@ -34,6 +32,8 @@ For automatic IP detection, one of these helps:
 - `ip`
 - `ifconfig`
 - `esxcli` (ESXi)
+
+`wget` is only used for simple GET connectivity checks when `curl` is unavailable. BusyBox `wget` on ESXi usually cannot send the login POST by itself, so the script falls back to Python 3 there.
 
 ## Quick Start
 
@@ -52,6 +52,12 @@ If you do not want to store the password in a file:
 ```
 
 The script will prompt for the password.
+
+You can also pass the username as the first positional argument:
+
+```sh
+./shanghaitech-net-auth.sh login 2025XXXXXXX -I vmk0
+```
 
 ## Common Usage
 
@@ -79,6 +85,14 @@ Probe the current portal backend only:
 ./shanghaitech-net-auth.sh probe
 ```
 
+Diagnose routing and portal reachability without entering credentials:
+
+```sh
+./shanghaitech-net-auth.sh doctor -I vmk0
+```
+
+On Linux, `doctor` and `login` can also open the portal TCP port in the local firewall if `firewalld`, `ufw`, or `iptables` is present. Disable that behavior with `--no-firewall`.
+
 ## Linux Server Notes
 
 For a wired server, the important part is usually the campus IP bound to the NIC:
@@ -104,6 +118,16 @@ Example:
 ```
 
 If `watch` mode is needed on ESXi, wire it into your own startup or scheduled task. The script itself stays plain `sh`; it does not assume `systemd`.
+
+Validated on an ESXi 6.7 test VM:
+
+- `/bin/sh` parses the script
+- `vmk0` IP detection works through `esxcli`
+- HTTPS POST uses Python 3 when `curl` is absent
+- portal network timeout is reported explicitly instead of being hidden as a script failure
+- `doctor` prints interface, route, DNS, and portal TCP reachability
+- `login` performs a TCP preflight before prompting for password unless `--skip-preflight` is set
+- `doctor`/`login` can auto-open the portal port on Linux or ESXi when a local firewall is present
 
 ## Cron Example
 
