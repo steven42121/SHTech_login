@@ -1,5 +1,5 @@
 # ShanghaiTech Campus Network Terminal Auth
-
+# 如果帮助到你了记得给给star！之后会一直维护
 This project provides a small POSIX `sh` script for ShanghaiTech campus-network login on headless machines such as Linux servers and ESXi hosts.
 
 It is not based only on an old GitHub implementation. I re-validated the live portal on `2026-04-27` from your machine:
