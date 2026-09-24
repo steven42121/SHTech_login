@@ -12,6 +12,7 @@ CHECK_URL_DEFAULT="http://www.msftconnecttest.com/connecttest.txt"
 CHECK_EXPECT_DEFAULT="Microsoft Connect Test"
 TIMEOUT_DEFAULT="8"
 INTERVAL_DEFAULT="60"
+STARTUP_DELAY_DEFAULT="0"
 
 ACTION=""
 CONFIG_FILE=""
@@ -32,6 +33,7 @@ TIMEOUT="${TIMEOUT:-$TIMEOUT_DEFAULT}"
 CHECK_URL="${CHECK_URL:-$CHECK_URL_DEFAULT}"
 CHECK_EXPECT="${CHECK_EXPECT:-$CHECK_EXPECT_DEFAULT}"
 INTERVAL="${INTERVAL:-$INTERVAL_DEFAULT}"
+STARTUP_DELAY="${STARTUP_DELAY:-$STARTUP_DELAY_DEFAULT}"
 INSECURE_TLS="${INSECURE_TLS:-1}"
 VERBOSE=0
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
@@ -79,12 +81,13 @@ usage() {
     printf '%s\n' "$line"
   done <<EOF
 Usage:
-  $SCRIPT_NAME [login|status|watch|probe|doctor] [options]
+  $SCRIPT_NAME [login|status|watch|probe|doctor|startup] [options]
 
 Commands:
   login              Perform one campus-network login. Default command.
   status             Show detected IP, portal sync result, and external reachability.
   watch              Check connectivity every N seconds and auto-login when offline.
+  startup            One-shot startup check: optional delay, then login only if offline.
   probe              Probe the portal endpoint only.
   doctor             Diagnose IP, route, DNS, and portal TCP connectivity without credentials.
 
@@ -104,6 +107,7 @@ Options:
       --check-url URL      External URL used by status/watch
       --check-expect TEXT  Expected content used by status/watch
       --interval SEC       Watch interval, default 60
+      --startup-delay SEC  Delay before startup check, default 0
   -t, --timeout SEC        HTTP timeout, default 8
       --secure-tls         Verify TLS certificate
       --skip-preflight     Skip portal TCP preflight before prompting for password
@@ -124,6 +128,7 @@ Examples:
   $SCRIPT_NAME doctor -I eth0
   $SCRIPT_NAME status -c ./shanghaitech-net-auth.conf
   $SCRIPT_NAME watch -c ./shanghaitech-net-auth.conf --interval 30
+  $SCRIPT_NAME startup -c ./shanghaitech-net-auth.conf --startup-delay 20
 EOF
 }
 
@@ -1035,10 +1040,41 @@ perform_watch() {
   done
 }
 
+perform_startup() {
+  case "$STARTUP_DELAY" in
+    ''|*[!0-9]*)
+      die "Invalid --startup-delay value: $STARTUP_DELAY"
+      ;;
+  esac
+
+  if [ "$STARTUP_DELAY" -gt 0 ]; then
+    log "Startup mode: waiting ${STARTUP_DELAY}s before connectivity check"
+    sleep "$STARTUP_DELAY"
+  fi
+
+  if check_online; then
+    log "Startup mode: internet is already reachable, no login needed"
+    return 0
+  fi
+
+  warn "Startup mode: internet unreachable, trying campus login..."
+  if ! perform_login; then
+    warn "Startup mode: login failed"
+    return 1
+  fi
+
+  if check_online; then
+    log "Startup mode: internet reachable after login"
+  else
+    warn "Startup mode: login succeeded but internet check still failed"
+  fi
+  return 0
+}
+
 apply_arguments() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      login|status|watch|probe)
+      login|status|watch|probe|startup)
         ACTION=$1
         shift
         ;;
@@ -1109,6 +1145,10 @@ apply_arguments() {
         ;;
       --interval)
         INTERVAL=$2
+        shift 2
+        ;;
+      --startup-delay)
+        STARTUP_DELAY=$2
         shift 2
         ;;
       -t|--timeout)
@@ -1184,6 +1224,9 @@ case "$ACTION" in
     ;;
   watch)
     perform_watch
+    ;;
+  startup)
+    perform_startup
     ;;
   probe)
     perform_probe

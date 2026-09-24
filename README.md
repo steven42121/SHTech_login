@@ -79,6 +79,12 @@ Keep retrying every 30 seconds:
 ./shanghaitech-net-auth.sh watch -c ./shanghaitech-net-auth.conf --interval 30
 ```
 
+One-shot startup check (optional delay, auto-login only when offline):
+
+```sh
+./shanghaitech-net-auth.sh startup -c ./shanghaitech-net-auth.conf --startup-delay 20
+```
+
 Probe the current portal backend only:
 
 ```sh
@@ -135,6 +141,12 @@ The simplest cron pattern is to attempt a login periodically:
 
 ```cron
 */2 * * * * /path/to/shanghaitech-net-auth.sh login -c /path/to/shanghaitech-net-auth.conf >/var/log/shtech-auth.log 2>&1
+```
+
+If you want delayed auto-start at boot with no resident process, use one-shot startup mode:
+
+```cron
+@reboot /path/to/shanghaitech-net-auth.sh startup -c /path/to/shanghaitech-net-auth.conf --startup-delay 20 >/var/log/shtech-auth-startup.log 2>&1
 ```
 
 If you want continuous monitoring, use `watch` under `systemd`, `supervisord`, `nohup`, or your ESXi startup flow instead of launching an infinite loop from cron.
