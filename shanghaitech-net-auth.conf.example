@@ -3,6 +3,13 @@
 USERNAME=2025XXXXXXX
 PASSWORD='replace-with-your-password'
 
+# Optional encrypted credentials (recommended over plain USERNAME/PASSWORD).
+# Generate with:
+#   ./shanghaitech-net-auth.sh encrypt -u 2025XXXXXXX --enc-key-file ~/.config/shanghaitech-net-auth.key
+# USERNAME_ENC='...'
+# PASSWORD_ENC='...'
+# ENC_KEY_FILE=/root/.config/shanghaitech-net-auth.key
+
 # Prefer a specific interface on servers, for example:
 #   Linux:  eth0 / ens192
 #   ESXi:   vmk0

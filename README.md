@@ -27,6 +27,10 @@ And a few standard tools that are commonly present on Linux / BusyBox / ESXi:
 - `sed`
 - `od`
 
+For encrypted local credential storage:
+
+- `openssl`
+
 For automatic IP detection, one of these helps:
 
 - `ip`
@@ -58,6 +62,25 @@ You can also pass the username as the first positional argument:
 ```sh
 ./shanghaitech-net-auth.sh login 2025XXXXXXX -I vmk0
 ```
+
+## Encrypted Local Credential Storage
+
+Generate encrypted config values locally:
+
+```sh
+./shanghaitech-net-auth.sh encrypt -u 2025XXXXXXX --enc-key-file ~/.config/shanghaitech-net-auth.key
+```
+
+Then put the output into your config:
+
+```sh
+USERNAME_ENC='...'
+PASSWORD_ENC='...'
+ENC_KEY_FILE=/home/you/.config/shanghaitech-net-auth.key
+```
+
+At runtime, the script will decrypt credentials and use them for `login/watch/startup`.
+You can also provide the key with `--enc-key` or environment variable `SH_NETAUTH_KEY`.
 
 ## Common Usage
 

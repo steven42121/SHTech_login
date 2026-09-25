@@ -20,6 +20,10 @@ USERNAME="${SH_NETAUTH_USERNAME:-}"
 PASSWORD="${SH_NETAUTH_PASSWORD:-}"
 IP_ADDR="${IP_ADDR:-}"
 INTERFACE="${INTERFACE:-}"
+USERNAME_ENC="${USERNAME_ENC:-}"
+PASSWORD_ENC="${PASSWORD_ENC:-}"
+ENC_KEY="${ENC_KEY:-${SH_NETAUTH_KEY:-}}"
+ENC_KEY_FILE="${ENC_KEY_FILE:-}"
 SERVER="${SERVER:-$SERVER_DEFAULT}"
 FALLBACK_SERVER="${FALLBACK_SERVER:-$FALLBACK_SERVER_DEFAULT}"
 AUTH_TYPE="${AUTH_TYPE:-1}"
@@ -81,13 +85,14 @@ usage() {
     printf '%s\n' "$line"
   done <<EOF
 Usage:
-  $SCRIPT_NAME [login|status|watch|probe|doctor|startup] [options]
+  $SCRIPT_NAME [login|status|watch|probe|doctor|startup|encrypt] [options]
 
 Commands:
   login              Perform one campus-network login. Default command.
   status             Show detected IP, portal sync result, and external reachability.
   watch              Check connectivity every N seconds and auto-login when offline.
   startup            One-shot startup check: optional delay, then login only if offline.
+  encrypt            Generate encrypted USERNAME/PASSWORD config values locally.
   probe              Probe the portal endpoint only.
   doctor             Diagnose IP, route, DNS, and portal TCP connectivity without credentials.
 
@@ -108,6 +113,8 @@ Options:
       --check-expect TEXT  Expected content used by status/watch
       --interval SEC       Watch interval, default 60
       --startup-delay SEC  Delay before startup check, default 0
+      --enc-key KEY        Encryption key for encrypted local credentials
+      --enc-key-file PATH  Read encryption key from local file (first line)
   -t, --timeout SEC        HTTP timeout, default 8
       --secure-tls         Verify TLS certificate
       --skip-preflight     Skip portal TCP preflight before prompting for password
@@ -129,6 +136,7 @@ Examples:
   $SCRIPT_NAME status -c ./shanghaitech-net-auth.conf
   $SCRIPT_NAME watch -c ./shanghaitech-net-auth.conf --interval 30
   $SCRIPT_NAME startup -c ./shanghaitech-net-auth.conf --startup-delay 20
+  $SCRIPT_NAME encrypt -u 2025xxxxxxx --enc-key-file ~/.config/shanghaitech-net-auth.key
 EOF
 }
 
@@ -242,6 +250,7 @@ prompt_secret() {
 }
 
 ensure_credentials() {
+  resolve_encrypted_credentials
   if [ -z "$USERNAME" ]; then
     printf 'Username: ' >&2
     IFS= read -r USERNAME
@@ -251,6 +260,79 @@ ensure_credentials() {
   fi
   [ -n "$USERNAME" ] || die "Username is required"
   [ -n "$PASSWORD" ] || die "Password is required"
+}
+
+require_openssl() {
+  have_cmd openssl || die "openssl is required for encrypted credential storage."
+}
+
+load_enc_key_from_file() {
+  if [ -n "$ENC_KEY" ]; then
+    return 0
+  fi
+  if [ -n "$ENC_KEY_FILE" ]; then
+    [ -f "$ENC_KEY_FILE" ] || die "Encryption key file not found: $ENC_KEY_FILE"
+    IFS= read -r ENC_KEY < "$ENC_KEY_FILE" || true
+  fi
+}
+
+prompt_hidden_value() {
+  prompt_text=$1
+  value=""
+  if have_cmd stty; then
+    saved_tty=$(stty -g 2>/dev/null || printf '')
+    stty -echo 2>/dev/null || true
+    printf '%s' "$prompt_text" >&2
+    IFS= read -r value
+    if [ -n "$saved_tty" ]; then
+      stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
+    else
+      stty echo 2>/dev/null || true
+    fi
+    printf '\n' >&2
+  else
+    printf '%s' "$prompt_text" >&2
+    IFS= read -r value
+  fi
+  printf '%s' "$value"
+}
+
+ensure_enc_key_for_decrypt() {
+  load_enc_key_from_file
+  if [ -n "$ENC_KEY" ]; then
+    return 0
+  fi
+  if [ -t 0 ]; then
+    ENC_KEY=$(prompt_hidden_value 'Credential encryption key: ')
+  fi
+  [ -n "$ENC_KEY" ] || die "Encrypted credentials detected but no key provided. Use --enc-key, --enc-key-file, or SH_NETAUTH_KEY."
+}
+
+decrypt_secret() {
+  cipher=$1
+  require_openssl
+  printf '%s' "$cipher" | openssl enc -aes-256-cbc -d -a -A -pbkdf2 -pass "pass:$ENC_KEY" 2>/dev/null
+}
+
+encrypt_secret() {
+  plain=$1
+  require_openssl
+  printf '%s' "$plain" | openssl enc -aes-256-cbc -a -A -pbkdf2 -salt -pass "pass:$ENC_KEY" 2>/dev/null
+}
+
+resolve_encrypted_credentials() {
+  if [ -z "$USERNAME_ENC" ] && [ -z "$PASSWORD_ENC" ]; then
+    return 0
+  fi
+
+  ensure_enc_key_for_decrypt
+
+  if [ -z "$USERNAME" ] && [ -n "$USERNAME_ENC" ]; then
+    USERNAME=$(decrypt_secret "$USERNAME_ENC") || die "Failed to decrypt USERNAME_ENC. Check key and ciphertext."
+  fi
+  if [ -z "$PASSWORD" ] && [ -n "$PASSWORD_ENC" ]; then
+    PASSWORD=$(decrypt_secret "${PASSWORD_ENC}") || die "Failed to decrypt PASSWORD_ENC. Check key and ciphertext."
+  fi
 }
 
 is_ipv4() {
@@ -1071,10 +1153,43 @@ perform_startup() {
   return 0
 }
 
+perform_encrypt() {
+  if [ -z "$USERNAME" ]; then
+    printf 'Username: ' >&2
+    IFS= read -r USERNAME
+  fi
+  if [ -z "$PASSWORD" ]; then
+    PASSWORD=$(prompt_hidden_value 'Password: ')
+  fi
+  [ -n "$USERNAME" ] || die "Username is required"
+  [ -n "$PASSWORD" ] || die "Password is required"
+
+  load_enc_key_from_file
+  if [ -z "$ENC_KEY" ]; then
+    key1=$(prompt_hidden_value 'Encryption key: ')
+    key2=$(prompt_hidden_value 'Confirm encryption key: ')
+    [ -n "$key1" ] || die "Encryption key is required"
+    [ "$key1" = "$key2" ] || die "Encryption key confirmation does not match."
+    ENC_KEY=$key1
+  fi
+
+  user_enc=$(encrypt_secret "$USERNAME") || die "Failed to encrypt username."
+  pass_enc=$(encrypt_secret "$PASSWORD") || die "Failed to encrypt password."
+
+  log "Use these in your config file:"
+  log "USERNAME_ENC='$user_enc'"
+  log "PASSWORD_ENC='$pass_enc'"
+  if [ -n "$ENC_KEY_FILE" ]; then
+    log "ENC_KEY_FILE='$ENC_KEY_FILE'"
+  else
+    log "# Provide the key by --enc-key, --enc-key-file, or SH_NETAUTH_KEY at runtime."
+  fi
+}
+
 apply_arguments() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      login|status|watch|probe|startup)
+      login|status|watch|probe|startup|encrypt)
         ACTION=$1
         shift
         ;;
@@ -1149,6 +1264,14 @@ apply_arguments() {
         ;;
       --startup-delay)
         STARTUP_DELAY=$2
+        shift 2
+        ;;
+      --enc-key)
+        ENC_KEY=$2
+        shift 2
+        ;;
+      --enc-key-file)
+        ENC_KEY_FILE=$2
         shift 2
         ;;
       -t|--timeout)
@@ -1227,6 +1350,9 @@ case "$ACTION" in
     ;;
   startup)
     perform_startup
+    ;;
+  encrypt)
+    perform_encrypt
     ;;
   probe)
     perform_probe
