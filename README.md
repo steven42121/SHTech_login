@@ -27,6 +27,10 @@ And a few standard tools that are commonly present on Linux / BusyBox / ESXi:
 - `sed`
 - `od`
 
+For encrypted local credential storage:
+
+- `openssl`
+
 For automatic IP detection, one of these helps:
 
 - `ip`
@@ -59,6 +63,25 @@ You can also pass the username as the first positional argument:
 ./shanghaitech-net-auth.sh login 2025XXXXXXX -I vmk0
 ```
 
+## Encrypted Local Credential Storage
+
+Generate encrypted config values locally:
+
+```sh
+./shanghaitech-net-auth.sh encrypt -u 2025XXXXXXX --enc-key-file ~/.config/shanghaitech-net-auth.key
+```
+
+Then put the output into your config:
+
+```sh
+USERNAME_ENC='...'
+PASSWORD_ENC='...'
+ENC_KEY_FILE=/home/you/.config/shanghaitech-net-auth.key
+```
+
+At runtime, the script will decrypt credentials and use them for `login/watch/startup`.
+You can also provide the key with `--enc-key` or environment variable `SH_NETAUTH_KEY`.
+
 ## Common Usage
 
 Login once:
@@ -77,6 +100,12 @@ Keep retrying every 30 seconds:
 
 ```sh
 ./shanghaitech-net-auth.sh watch -c ./shanghaitech-net-auth.conf --interval 30
+```
+
+One-shot startup check (optional delay, auto-login only when offline):
+
+```sh
+./shanghaitech-net-auth.sh startup -c ./shanghaitech-net-auth.conf --startup-delay 20
 ```
 
 Probe the current portal backend only:
@@ -135,6 +164,12 @@ The simplest cron pattern is to attempt a login periodically:
 
 ```cron
 */2 * * * * /path/to/shanghaitech-net-auth.sh login -c /path/to/shanghaitech-net-auth.conf >/var/log/shtech-auth.log 2>&1
+```
+
+If you want delayed auto-start at boot with no resident process, use one-shot startup mode:
+
+```cron
+@reboot /path/to/shanghaitech-net-auth.sh startup -c /path/to/shanghaitech-net-auth.conf --startup-delay 20 >/var/log/shtech-auth-startup.log 2>&1
 ```
 
 If you want continuous monitoring, use `watch` under `systemd`, `supervisord`, `nohup`, or your ESXi startup flow instead of launching an infinite loop from cron.
